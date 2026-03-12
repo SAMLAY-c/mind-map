@@ -1,340 +1,427 @@
+'use strict'
+
+// 加载环境变量
+require('dotenv').config()
+
 const express = require('express')
 const crypto = require('crypto')
 const path = require('path')
-const fs = require('fs')
 
-const port = 3457
+const app = express()
+const port = process.env.PORT || 3457
+const SERVER_URL = process.env.SERVER_URL || 'http://38.134.18.201:3457'
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN
 
-// 使用 CDN 加载 simple-mind-map，不内嵌任何代码
-const CDN_URL = 'https://cdn.jsdelivr.net/npm/simple-mind-map@0.14.0-fix.1/dist/simpleMindMap.umd.min.js'
-
-// 生成随机文件名
-const generateRandomFileName = () => {
-  return crypto.randomBytes(16).toString('hex') + '.html'
+// ─── 启动检查 ────────────────────────────────────────────────
+if (!GITHUB_TOKEN) {
+  console.error('❌ 缺少 GITHUB_TOKEN，请在 .env 文件中配置')
+  process.exit(1)
 }
 
-// 主题配置（映射 simple-mind-map 的主题）
-const themeMap = {
-  default: 'classic',      // 默认主题
-  classic: 'classic',       // 经典主题
-  minimal: 'fresh',         // 简约主题（对应 fresh 主题）
+// ─── 中间件 ──────────────────────────────────────────────────
+app.use(express.json({ limit: '10mb' }))
+app.use(express.urlencoded({ extended: true }))
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*')
+  res.header('Access-Control-Allow-Methods', 'GET,POST,PATCH,OPTIONS')
+  res.header('Access-Control-Allow-Headers', 'Content-Type')
+  if (req.method === 'OPTIONS') return res.sendStatus(200)
+  next()
+})
+
+// ─── GitHub Gist API 封装 ────────────────────────────────────
+const GIST_HEADERS = {
+  'Accept': 'application/vnd.github+json',
+  'Authorization': `Bearer ${GITHUB_TOKEN}`,
+  'X-GitHub-Api-Version': '2022-11-28',
+  'Content-Type': 'application/json',
+  'User-Agent': 'mind-map-server'
 }
 
-// 解析 Markdown 为 simple-mind-map 格式
+async function gistCreate(title, data) {
+  const fetch = (await import('node-fetch')).default
+  const res = await fetch('https://api.github.com/gists', {
+    method: 'POST',
+    headers: GIST_HEADERS,
+    body: JSON.stringify({
+      description: title || '思维导图',
+      public: false,
+      files: {
+        'mindmap.json': {
+          content: JSON.stringify(data, null, 2)
+        }
+      }
+    })
+  })
+  if (!res.ok) {
+    const err = await res.text()
+    throw new Error(`创建 Gist 失败: ${res.status} ${err}`)
+  }
+  return res.json()
+}
+
+async function gistGet(gistId) {
+  const fetch = (await import('node-fetch')).default
+  const res = await fetch(`https://api.github.com/gists/${gistId}`, {
+    headers: GIST_HEADERS
+  })
+  if (!res.ok) throw new Error(`读取 Gist 失败: ${res.status}`)
+  return res.json()
+}
+
+async function gistUpdate(gistId, data) {
+  const fetch = (await import('node-fetch')).default
+  const res = await fetch(`https://api.github.com/gists/${gistId}`, {
+    method: 'PATCH',
+    headers: GIST_HEADERS,
+    body: JSON.stringify({
+      files: {
+        'mindmap.json': {
+          content: JSON.stringify(data, null, 2)
+        }
+      }
+    })
+  })
+  if (!res.ok) throw new Error(`更新 Gist 失败: ${res.status}`)
+  return res.json()
+}
+
+async function gistHistory(gistId) {
+  const fetch = (await import('node-fetch')).default
+  const res = await fetch(`https://api.github.com/gists/${gistId}/commits`, {
+    headers: GIST_HEADERS
+  })
+  if (!res.ok) throw new Error(`读取历史失败: ${res.status}`)
+  return res.json()
+}
+
+// ─── Markdown 解析 ───────────────────────────────────────────
 function parseMarkdown(markdown) {
-  const lines = markdown.split('\n').filter(line => line.trim())
+  const lines = markdown.split('\n').filter(l => l.trim())
+  if (lines.length === 0) return { data: { text: '思维导图' }, children: [] }
 
-  if (lines.length === 0) {
-    return {
-      data: { text: '思维导图' },
-      children: []
-    }
-  }
-
-  // 将每一行转换为节点
-  const parsedLines = []
-
+  const parsed = []
   for (const line of lines) {
-    // 标题：# ## ### 等
-    const headingMatch = line.match(/^(#+)\s+(.+)$/)
-    if (headingMatch) {
-      const hashes = headingMatch[1]
-      const text = headingMatch[2].trim()
-      parsedLines.push({
-        level: hashes.length,
-        text: text,
-        type: 'heading'
-      })
+    const h = line.match(/^(#{1,6})\s+(.+)$/)
+    if (h) {
+      parsed.push({ level: h[1].length, text: h[2].trim() })
       continue
     }
-
-    // 列表：- * + 或 1. 2. 3. 等
-    const listMatch = line.match(/^(\s*)([-*+]|\d+\.)\s+(.+)$/)
-    if (listMatch) {
-      const indent = listMatch[1]
-      const text = listMatch[3].trim()
-      const indentLevel = Math.floor(indent.length / 2)
-      parsedLines.push({
-        level: 999, // 临时值
-        text: text,
-        type: 'list',
-        indent: indent.length
-      })
-      continue
+    const li = line.match(/^(\s*)([-*+]|\d+\.)\s+(.+)$/)
+    if (li) {
+      parsed.push({ level: 999, text: li[3].trim(), indent: li[1].length })
     }
   }
 
-  if (parsedLines.length === 0) {
-    return {
-      data: { text: '思维导图' },
-      children: []
+  if (parsed.length === 0) return { data: { text: '思维导图' }, children: [] }
+
+  // 计算列表的实际层级
+  let baseLevel = 1
+  for (const item of parsed) {
+    if (item.level !== 999) {
+      baseLevel = item.level
+    } else {
+      item.level = baseLevel + 1 + Math.floor(item.indent / 2)
     }
   }
 
-  // 后处理：计算列表的实际层级
-  let currentBaseLevel = 1
-  for (let i = 0; i < parsedLines.length; i++) {
-    const item = parsedLines[i]
-    if (item.type === 'heading') {
-      currentBaseLevel = item.level
-    } else if (item.type === 'list' && item.level === 999) {
-      const indentLevel = Math.floor(item.indent / 2)
-      item.level = currentBaseLevel + 1 + indentLevel
-    }
-  }
+  // 构建树（simple-mind-map 格式）
+  const toNode = text => ({ data: { text }, children: [] })
+  const root = toNode(parsed[0].text)
+  const stack = [{ node: root, level: parsed[0].level }]
 
-  // 构建树结构（simple-mind-map 格式）
-  const root = {
-    data: { text: parsedLines[0].text },
-    children: []
-  }
-  const stack = [{ node: root, level: parsedLines[0].level }]
-
-  for (let i = 1; i < parsedLines.length; i++) {
-    const current = parsedLines[i]
-    const newNode = {
-      data: { text: current.text },
-      children: []
-    }
-
-    // 找到父节点
-    while (stack.length > 0 && stack[stack.length - 1].level >= current.level) {
+  for (let i = 1; i < parsed.length; i++) {
+    const cur = parsed[i]
+    const node = toNode(cur.text)
+    while (stack.length > 0 && stack[stack.length - 1].level >= cur.level) {
       stack.pop()
     }
-
-    if (stack.length === 0) {
-      stack.push({ node: newNode, level: current.level })
-    } else {
-      const parent = stack[stack.length - 1].node
-      parent.children.push(newNode)
-      stack.push({ node: newNode, level: current.level })
+    if (stack.length > 0) {
+      stack[stack.length - 1].node.children.push(node)
     }
+    stack.push({ node, level: cur.level })
   }
 
   return root
 }
 
-// 生成独立的 HTML 文件
-function generateHTML(data, title, theme = 'default') {
-  const smTheme = themeMap[theme] || 'classic'
-  const dataJson = JSON.stringify(data)
+// ─── 生成查看页面 HTML ───────────────────────────────────────
+function buildViewPage(gistId, mindMapData, title) {
+  const dataJson = JSON.stringify(mindMapData)
+  const safeTitle = (title || '思维导图').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 
-  // 返回使用 CDN 加载的 HTML，修复 DOM ready 和容器尺寸问题
   return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>${escapeHtml(title)}</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        html, body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            background: #f5f5f5;
-            width: 100%;
-            height: 100%;
-            overflow: hidden;
-        }
-        #mindMapContainer {
-            width: 100%;
-            height: 100vh;
-            position: relative;
-        }
-    </style>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${safeTitle}</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f0f2f5; height: 100vh; display: flex; flex-direction: column; }
+    #toolbar {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 10px 20px; background: #fff;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.1); z-index: 10; flex-shrink: 0;
+    }
+    #toolbar h1 { font-size: 16px; color: #333; }
+    #toolbar .actions { display: flex; gap: 10px; align-items: center; }
+    #saveBtn {
+      padding: 6px 18px; background: #4e6ef2; color: #fff;
+      border: none; border-radius: 6px; cursor: pointer; font-size: 14px;
+    }
+    #saveBtn:hover { background: #3a5bd9; }
+    #saveBtn:disabled { background: #aaa; cursor: not-allowed; }
+    #historyBtn {
+      padding: 6px 14px; background: #fff; color: #555;
+      border: 1px solid #ddd; border-radius: 6px; cursor: pointer; font-size: 14px;
+    }
+    #historyBtn:hover { background: #f5f5f5; }
+    #status { font-size: 12px; color: #999; }
+    #mindMapContainer { flex: 1; width: 100%; }
+
+    /* 历史面板 */
+    #historyPanel {
+      display: none; position: fixed; right: 0; top: 0; bottom: 0; width: 300px;
+      background: #fff; box-shadow: -2px 0 8px rgba(0,0,0,0.15);
+      z-index: 100; flex-direction: column;
+    }
+    #historyPanel.open { display: flex; }
+    #historyHeader {
+      padding: 16px; border-bottom: 1px solid #eee;
+      display: flex; justify-content: space-between; align-items: center;
+    }
+    #historyHeader h2 { font-size: 15px; color: #333; }
+    #closeHistory { background: none; border: none; font-size: 20px; cursor: pointer; color: #999; }
+    #historyList { flex: 1; overflow-y: auto; padding: 8px; }
+    .history-item {
+      padding: 10px 12px; border-radius: 6px; cursor: pointer;
+      border: 1px solid #eee; margin-bottom: 6px;
+    }
+    .history-item:hover { background: #f5f7ff; border-color: #4e6ef2; }
+    .history-item .time { font-size: 13px; color: #333; font-weight: 500; }
+    .history-item .version { font-size: 11px; color: #999; margin-top: 2px; font-family: monospace; }
+  </style>
 </head>
 <body>
-    <div id="mindMapContainer"></div>
-    <!-- 从 CDN 加载 simple-mind-map 库 -->
-    <script src="${CDN_URL}"></script>
-    <script>
-        // 等待 DOM 和库都加载完成
-        window.onload = function() {
-            // simple-mind-map 导出为全局 simpleMindMap 对象
-            const mindMapData = ${dataJson};
-            const mindMap = new simpleMindMap.default({
-                el: document.getElementById("mindMapContainer"),
-                data: mindMapData,
-                theme: "${smTheme}",
-                layout: "mindMap",
-                enableFreeDrag: true,
-                enableNodeEdit: true,
-                enableCtrlKeyNodeSelection: true
-            });
-            console.log("✅ 思维导图已加载");
-        };
-    </script>
+  <div id="toolbar">
+    <h1>${safeTitle}</h1>
+    <div class="actions">
+      <span id="status">已加载</span>
+      <button id="historyBtn" onclick="toggleHistory()">📋 历史版本</button>
+      <button id="saveBtn" onclick="saveMindMap()">💾 保存</button>
+    </div>
+  </div>
+  <div id="mindMapContainer"></div>
+
+  <div id="historyPanel">
+    <div id="historyHeader">
+      <h2>历史版本</h2>
+      <button id="closeHistory" onclick="toggleHistory()">×</button>
+    </div>
+    <div id="historyList"><p style="padding:16px;color:#999;font-size:13px">加载中...</p></div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/simple-mind-map@0.14.0-fix.1/dist/simpleMindMap.umd.min.js"></script>
+  <script>
+    const GIST_ID = '${gistId}'
+    // 动态获取当前页面的协议和主机，避免跨域问题
+    const SERVER = window.location.protocol + '//' + window.location.host
+    let mindMap = null
+
+    // 初始化思维导图
+    window.onload = function() {
+      const data = ${dataJson}
+      mindMap = new simpleMindMap.default({
+        el: document.getElementById('mindMapContainer'),
+        data: data,
+        layout: 'logicalStructure',
+        theme: 'classic',
+        enableFreeDrag: true,
+        enableNodeEdit: true
+      })
+      setStatus('已加载')
+    }
+
+    // 保存到服务器（更新 Gist）
+    async function saveMindMap() {
+      const btn = document.getElementById('saveBtn')
+      btn.disabled = true
+      setStatus('保存中...')
+      try {
+        const data = mindMap.getData()
+        const res = await fetch(SERVER + '/api/save/' + GIST_ID, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ data })
+        })
+        const json = await res.json()
+        if (json.code === 0) {
+          setStatus('✅ 已保存 ' + new Date().toLocaleTimeString())
+        } else {
+          setStatus('❌ 保存失败: ' + json.msg)
+        }
+      } catch(e) {
+        setStatus('❌ 网络错误')
+      }
+      btn.disabled = false
+    }
+
+    // 显示/隐藏历史面板
+    async function toggleHistory() {
+      const panel = document.getElementById('historyPanel')
+      const isOpen = panel.classList.toggle('open')
+      if (isOpen) loadHistory()
+    }
+
+    async function loadHistory() {
+      const list = document.getElementById('historyList')
+      list.innerHTML = '<p style="padding:16px;color:#999;font-size:13px">加载中...</p>'
+      try {
+        const res = await fetch(SERVER + '/api/history/' + GIST_ID)
+        const json = await res.json()
+        if (json.code !== 0) { list.innerHTML = '<p style="padding:16px;color:red">加载失败</p>'; return }
+        const commits = json.data
+        if (commits.length === 0) { list.innerHTML = '<p style="padding:16px;color:#999;font-size:13px">暂无历史</p>'; return }
+        list.innerHTML = commits.map((c, i) => {
+          const time = new Date(c.committed_at || c.created_at).toLocaleString()
+          return '<div class="history-item">'
+            + '<div class="time">' + (i === 0 ? '🟢 当前版本  ' : '') + time + '</div>'
+            + '<div class="version">' + c.version.substring(0, 12) + '</div>'
+            + '</div>'
+        }).join('')
+      } catch(e) {
+        list.innerHTML = '<p style="padding:16px;color:red">网络错误</p>'
+      }
+    }
+
+    function setStatus(msg) {
+      document.getElementById('status').textContent = msg
+    }
+  </script>
 </body>
 </html>`
 }
 
-// HTML 转义函数
-function escapeHtml(text) {
-  const map = {
-    '&': '&amp;',
-    '<': '&lt;',
-    '>': '&gt;',
-    '"': '&quot;',
-    "'": '&#039;'
-  }
-  return text.replace(/[&<>"']/g, m => map[m])
-}
+// ═══════════════════════════════════════════════════════════════
+// 路由
+// ═══════════════════════════════════════════════════════════════
 
-const createServer = () => {
-  const app = express()
+// 健康检查
+app.get('/health', (req, res) => {
+  res.json({ code: 0, msg: 'Mind Map Server is running', version: '2.0.0' })
+})
 
-  // 配置 body 解析
-  app.use(express.json({ limit: '50mb' }))
-  app.use(express.urlencoded({ extended: true, limit: '50mb' }))
+// ── POST /api/create ─────────────────────────────────────────
+// 传入 markdown，创建 Gist，返回可访问的链接
+app.post('/api/create', async (req, res) => {
+  try {
+    const { markdown, title } = req.body
+    if (!markdown) return res.status(400).json({ code: 1, msg: '缺少 markdown 参数' })
 
-  // CORS
-  app.use((req, res, next) => {
-    res.header('Access-Control-Allow-Origin', '*')
-    res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-    res.header('Access-Control-Allow-Headers', 'Content-Type')
-    if (req.method === 'OPTIONS') {
-      return res.sendStatus(200)
-    }
-    next()
-  })
+    const mindMapData = parseMarkdown(markdown)
+    const payload = { title: title || '思维导图', data: mindMapData, createdAt: new Date().toISOString() }
 
-  // 健康检查
-  app.get('/health', (req, res) => {
+    const gist = await gistCreate(title, payload)
+    const viewUrl = `${SERVER_URL}/view/${gist.id}`
+
     res.json({
       code: 0,
-      msg: 'Markdown to MindMap API Server is running',
-      timestamp: new Date().toISOString(),
-      library: 'simple-mind-map',
-      version: require('../../simple-mind-map/package.json').version
+      msg: 'success',
+      data: {
+        gistId: gist.id,
+        viewUrl,
+        gistUrl: gist.html_url
+      }
     })
-  })
+  } catch (e) {
+    console.error(e)
+    res.status(500).json({ code: 1, msg: e.message })
+  }
+})
 
-  // 核心 API：Markdown → HTML
-  app.post('/api/markdown-to-html', async (req, res) => {
-    try {
-      const { markdown, title = '思维导图', theme = 'default', saveToFile = false } = req.body
+// ── GET /view/:gistId ────────────────────────────────────────
+// 从 Gist 读数据，返回可交互的 HTML 页面
+app.get('/view/:gistId', async (req, res) => {
+  try {
+    const gist = await gistGet(req.params.gistId)
+    const fileContent = gist.files['mindmap.json']?.content
+    if (!fileContent) return res.status(404).send('数据不存在')
 
-      if (!markdown) {
-        return res.status(400).json({
-          code: 1,
-          msg: '请提供 markdown 内容'
-        })
-      }
+    const payload = JSON.parse(fileContent)
+    const html = buildViewPage(req.params.gistId, payload.data, payload.title)
 
-      // 解析 Markdown 为 simple-mind-map 格式
-      const mindMapData = parseMarkdown(markdown)
+    res.setHeader('Content-Type', 'text/html; charset=utf-8')
+    res.send(html)
+  } catch (e) {
+    console.error(e)
+    res.status(500).send(`<h2>加载失败</h2><pre>${e.message}</pre>`)
+  }
+})
 
-      // 生成独立 HTML
-      const html = generateHTML(mindMapData, title, theme)
+// ── POST /api/save/:gistId ───────────────────────────────────
+// 用户编辑后保存，更新 Gist（产生新版本记录）
+app.post('/api/save/:gistId', async (req, res) => {
+  try {
+    const { data } = req.body
+    if (!data) return res.status(400).json({ code: 1, msg: '缺少 data 参数' })
 
-      // 生成随机文件名
-      const fileName = generateRandomFileName()
+    // 先读现有数据拿到 title
+    const gist = await gistGet(req.params.gistId)
+    const old = JSON.parse(gist.files['mindmap.json']?.content || '{}')
 
-      // 可选：保存到文件
-      if (saveToFile) {
-        const outputDir = path.join(__dirname, '../../output')
-        if (!fs.existsSync(outputDir)) {
-          fs.mkdirSync(outputDir, { recursive: true })
-        }
-        fs.writeFileSync(path.join(outputDir, fileName), html)
-      }
+    await gistUpdate(req.params.gistId, {
+      title: old.title || '思维导图',
+      data,
+      updatedAt: new Date().toISOString()
+    })
 
-      res.json({
-        code: 0,
-        msg: 'success',
-        data: {
-          fileName: fileName,
-          title: title,
-          htmlSize: html.length,
-          downloadUrl: `/download/${fileName}`
-        }
-      })
+    res.json({ code: 0, msg: 'saved' })
+  } catch (e) {
+    console.error(e)
+    res.status(500).json({ code: 1, msg: e.message })
+  }
+})
 
-    } catch (error) {
-      console.error('转换失败:', error)
-      res.status(500).json({
-        code: 1,
-        msg: '转换失败: ' + error.message
-      })
-    }
-  })
+// ── GET /api/history/:gistId ─────────────────────────────────
+// 返回版本历史列表
+app.get('/api/history/:gistId', async (req, res) => {
+  try {
+    const commits = await gistHistory(req.params.gistId)
+    res.json({ code: 0, data: commits })
+  } catch (e) {
+    res.status(500).json({ code: 1, msg: e.message })
+  }
+})
 
-  // 直接下载接口
-  app.post('/api/download', async (req, res) => {
-    try {
-      const { markdown, title = '思维导图', theme = 'default' } = req.body
+// ── 旧接口兼容：POST /api/download ──────────────────────────
+// 保留原来的接口，直接返回 HTML（无持久化）
+app.post('/api/download', async (req, res) => {
+  try {
+    const { markdown, title } = req.body
+    if (!markdown) return res.status(400).json({ code: 1, msg: '缺少 markdown 参数' })
 
-      if (!markdown) {
-        return res.status(400).json({
-          code: 1,
-          msg: '请提供 markdown 内容'
-        })
-      }
+    const mindMapData = parseMarkdown(markdown)
+    const html = buildViewPage('__local__', mindMapData, title)
 
-      const mindMapData = parseMarkdown(markdown)
-      const html = generateHTML(mindMapData, title, theme)
-      const fileName = generateRandomFileName()
+    res.setHeader('Content-Type', 'text/html; charset=utf-8')
+    res.setHeader('Content-Disposition', `attachment; filename="mindmap-${Date.now()}.html"`)
+    res.send(html)
+  } catch (e) {
+    res.status(500).json({ code: 1, msg: e.message })
+  }
+})
 
-      // 设置响应头
-      res.setHeader('Content-Type', 'text/html; charset=utf-8')
-      res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`)
-
-      // 发送 HTML
-      res.send(html)
-
-    } catch (error) {
-      console.error('生成失败:', error)
-      res.status(500).json({
-        code: 1,
-        msg: '生成失败: ' + error.message
-      })
-    }
-  })
-
-  // GET 下载（用于测试）
-  app.get('/download/:fileName', (req, res) => {
-    try {
-      const { markdown, title, theme } = req.query
-
-      if (!markdown) {
-        return res.status(400).send('缺少 markdown 参数')
-      }
-
-      const mindMapData = parseMarkdown(markdown)
-      const html = generateHTML(mindMapData, title || '思维导图', theme || 'default')
-
-      res.setHeader('Content-Type', 'text/html; charset=utf-8')
-      res.setHeader('Content-Disposition', `attachment; filename="${req.params.fileName}"`)
-      res.send(html)
-
-    } catch (error) {
-      res.status(500).send('生成失败: ' + error.message)
-    }
-  })
-
-  // 启动服务器
-  app.listen(port, () => {
-    console.log('')
-    console.log('╔════════════════════════════════════════╗')
-    console.log('║  Markdown → MindMap API Server         ║')
-    console.log(`║  Running on: http://localhost:${port}     ║`)
-    console.log('╚════════════════════════════════════════╝')
-    console.log('')
-    console.log('📦 使用库: simple-mind-map v' + require('../../simple-mind-map/package.json').version)
-    console.log('📦 库文件: dist/simpleMindMap.umd.min.js (6.6MB)')
-    console.log('')
-    console.log('API 端点:')
-    console.log('  POST /api/markdown-to-html  - 转换并返回 JSON')
-    console.log('  POST /api/download          - 直接下载 HTML')
-    console.log('  GET  /health                - 健康检查')
-    console.log('')
-    console.log('测试命令:')
-    console.log(`  curl -X POST http://localhost:${port}/api/download \\`)
-    console.log(`    -H "Content-Type: application/json" \\`)
-    console.log(`    -d '{"markdown":"# 标题\\n## 子标题"}' \\`)
-    console.log(`    -o mindmap.html`)
-    console.log('')
-  })
-}
-
-// 启动服务器
-createServer()
+// ─── 启动 ────────────────────────────────────────────────────
+app.listen(port, '0.0.0.0', () => {
+  console.log(`✅ Mind Map Server 运行中`)
+  console.log(`   本地访问: http://localhost:${port}`)
+  console.log(`   公网访问: ${SERVER_URL}`)
+  console.log(`   健康检查: ${SERVER_URL}/health`)
+  console.log('')
+  console.log('📌 API 说明:')
+  console.log(`   POST /api/create     → 传入 markdown，返回永久链接`)
+  console.log(`   GET  /view/:gistId   → 打开可编辑的思维导图`)
+  console.log(`   POST /api/save/:id   → 保存修改（自动版本记录）`)
+  console.log(`   GET  /api/history/:id → 查看历史版本`)
+})
